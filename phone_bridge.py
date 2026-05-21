@@ -97,12 +97,14 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
 
 
 def compute_target(difficulty):
-    """Convert difficulty to 32-byte target hex"""
-    if not difficulty:
+    """Convert difficulty to 32-byte target hex (big-endian)"""
+    if not difficulty or difficulty <= 0:
         difficulty = 1
-    max_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    target = max_target // int(difficulty)
-    return target.to_bytes(32, 'little').hex()
+    # VerusCoin target calculation
+    # diff1 target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    target = int(diff1 / difficulty)
+    return target.to_bytes(32, 'big').hex()
 
 
 class StratumClient:
