@@ -136,10 +136,13 @@ class StratumClient:
     def subscribe(self):
         self.send('mining.subscribe', ['phone_bridge/1.0.0'])
         resp = self.recv_response()
-        if resp.get('result'):
-            self.extranonce1 = resp['result'][1]
-            self.extranonce2_size = resp['result'][2]
-            log.info(f'Subscribed. extranonce1={self.extranonce1}')
+        result = resp.get('result')
+        if result:
+            # Luckpool returns [null, extranonce1] or [subscriptions, extranonce1, extranonce2_size]
+            if isinstance(result, list) and len(result) >= 2:
+                self.extranonce1 = result[1] if result[1] else result[0]
+                self.extranonce2_size = result[2] if len(result) > 2 else 4
+            log.info(f'Subscribed. extranonce1={self.extranonce1} extranonce2_size={self.extranonce2_size}')
 
     def authorize(self):
         self.send('mining.authorize', [f'{WALLET}.{WORKER}', PASSWORD])
