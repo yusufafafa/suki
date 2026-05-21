@@ -65,16 +65,38 @@ def safe_hex(h, length=0):
 
 
 def build_header(job, extranonce1, extranonce2, nonce=0):
-    """Build 80-byte block header from stratum job"""
+    """Build 80-byte block header from Luckpool stratum job
+    
+    Luckpool format (from debug):
+    params[0] = job_id
+    params[1] = version (e.g. '04000100')
+    params[2] = prevhash (64 hex chars)
+    params[3] = coinb1
+    params[4] = merkle_branch (list)
+    params[5] = coinb2
+    params[6] = nbits
+    params[7] = clean_jobs (bool)
+    params[8] = ntime (or extra data)
+    """
     try:
-        version       = job[5] if len(job) > 5 else '00000001'
-        prevhash      = job[1] if len(job) > 1 else '00' * 32
-        coinb1        = job[2] if len(job) > 2 else ''
-        coinb2        = job[3] if len(job) > 3 else ''
+        version       = job[1] if len(job) > 1 else '00000004'
+        prevhash      = job[2] if len(job) > 2 else '00' * 32
+        coinb1        = job[3] if len(job) > 3 else ''
         merkle_branch = job[4] if len(job) > 4 else []
+        coinb2        = job[5] if len(job) > 5 else ''
         nbits         = job[6] if len(job) > 6 else '1e0fffff'
-        ntime_raw     = job[7] if len(job) > 7 else None
-        ntime         = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
+        # ntime: look for string value after clean_jobs bool
+        ntime = None
+        for p in job[7:]:
+            if isinstance(p, str) and len(p) == 8:
+                try:
+                    int(p, 16)
+                    ntime = p
+                    break
+                except ValueError:
+                    pass
+        if not ntime:
+            ntime = '%08x' % int(time.time())
 
         # Build coinbase
         coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -89,14 +111,14 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
                 hashlib.sha256(merkle_root + branch_bytes).digest()
             ).digest()
 
-        # Build 80-byte header using swap_endian_words (per 4-byte word swap)
+        # Build 80-byte header using swap_endian_words
         header = (
-            swap_endian_words(version.zfill(8)) +    # version: swap per word
-            swap_endian_words(prevhash.zfill(64)) +   # prevhash: swap per word
-            merkle_root +                              # merkle root: raw bytes
-            swap_endian_words(ntime.zfill(8)) +       # ntime: swap per word
-            swap_endian_words(nbits.zfill(8)) +       # nbits: swap per word
-            struct.pack('<I', nonce)                   # nonce: little-endian
+            swap_endian_words(version.zfill(8)) +
+            swap_endian_words(prevhash.zfill(64)) +
+            merkle_root +
+            swap_endian_words(ntime.zfill(8)) +
+            swap_endian_words(nbits.zfill(8)) +
+            struct.pack('<I', nonce)
         )
         return header
     except Exception as e:
@@ -259,9 +281,20 @@ class StratumClient:
 
         job = self.current_job
         job_id = job[0]
-        ntime_raw = job[7] if len(job) > 7 else None
-        ntime = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
         extranonce2 = '00' * self.extranonce2_size
+
+        # Find ntime - look for 8-char hex string after index 6
+        ntime = None
+        for p in job[7:]:
+            if isinstance(p, str) and len(p) == 8:
+                try:
+                    int(p, 16)
+                    ntime = p
+                    break
+                except ValueError:
+                    pass
+        if not ntime:
+            ntime = '%08x' % int(time.time())
 
         # Build header
         try:
