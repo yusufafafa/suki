@@ -31,7 +31,7 @@ PASSWORD  = 'x'
 # Cloudflare Worker URL
 WORKER_URL = os.environ.get('WORKER_URL', 'https://cord1-rifaiminer.adijayasukabumi.workers.dev')
 
-BATCH_SIZE = 1000  # Increase batch size for better share finding
+BATCH_SIZE = 100  # CF Worker 10ms CPU limit - keep small
 
 
 def hex_to_bytes(h):
@@ -235,9 +235,15 @@ class StratumClient:
                 },
                 timeout=30
             )
+            if resp.status_code != 200:
+                print(f'[ERROR] Worker HTTP {resp.status_code}: {resp.text[:100]}')
+                return None
             return resp.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print(f'[ERROR] Worker JSON parse failed: {resp.text[:100]}')
+            return None
         except Exception as e:
-            log.error(f'Worker request failed: {e}')
+            print(f'[ERROR] Worker request failed: {e}')
             return None
 
     def submit_share(self, job_id, extranonce2, ntime, nonce_hex):
