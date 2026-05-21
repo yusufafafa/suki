@@ -244,13 +244,10 @@ class StratumClient:
         if clean or self.current_job is None or self.current_job[0] != job_id:
             self.stats['jobs'] += 1
             print(f'\nNEW JOB RECEIVED: Job ID {job_id}')
-            # Debug: print raw job fields
             if self.stats['jobs'] <= 2:
-                print(f'[DEBUG] version={params[5] if len(params)>5 else "?"}')
-                print(f'[DEBUG] prevhash={params[1][:20] if len(params)>1 else "?"}...')
-                print(f'[DEBUG] nbits={params[6] if len(params)>6 else "?"}')
-                print(f'[DEBUG] ntime={params[7] if len(params)>7 else "?"}')
-                print(f'[DEBUG] total params={len(params)}')
+                for i, p in enumerate(params):
+                    val = str(p)[:40] if isinstance(p, str) else str(p)
+                    print(f'[DEBUG] params[{i}] = {val}')
             self.current_job = params
             with self.nonce_lock:
                 self.nonce_counter = 0
