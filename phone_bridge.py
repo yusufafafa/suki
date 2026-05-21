@@ -256,6 +256,9 @@ class StratumClient:
         try:
             header = build_header(job, self.extranonce1, extranonce2)
             header_hex = header.hex()
+            if self.stats['jobs'] <= 1:
+                print(f'[DEBUG] Header ({len(header)} bytes): {header_hex[:40]}...')
+                print(f'[DEBUG] extranonce1={self.extranonce1} extranonce2={extranonce2}')
         except Exception as e:
             log.error(f'Header build failed: {e}')
             return
