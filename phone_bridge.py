@@ -42,6 +42,15 @@ def bytes_to_hex(b):
     return b.hex()
 
 
+def swap_endian_words(hex_words):
+    """Swap endianness per 4-byte word (as used in stratum protocol)"""
+    b = bytes.fromhex(hex_words)
+    if len(b) % 4 != 0:
+        # Pad to 4-byte boundary
+        b = b + bytes(4 - len(b) % 4)
+    return b''.join([b[4*i:4*i+4][::-1] for i in range(len(b)//4)])
+
+
 def safe_hex(h, length=0):
     """Safely convert hex string, pad or truncate to length bytes"""
     if not h:
@@ -57,17 +66,15 @@ def safe_hex(h, length=0):
 
 def build_header(job, extranonce1, extranonce2, nonce=0):
     """Build 80-byte block header from stratum job"""
-    # job = [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean]
     try:
-        version    = job[5] if len(job) > 5 else '00000001'
-        prevhash   = job[1] if len(job) > 1 else '00' * 32
-        coinb1     = job[2] if len(job) > 2 else ''
-        coinb2     = job[3] if len(job) > 3 else ''
+        version       = job[5] if len(job) > 5 else '00000001'
+        prevhash      = job[1] if len(job) > 1 else '00' * 32
+        coinb1        = job[2] if len(job) > 2 else ''
+        coinb2        = job[3] if len(job) > 3 else ''
         merkle_branch = job[4] if len(job) > 4 else []
-        nbits      = job[6] if len(job) > 6 else '1e0fffff'
-        # ntime: index 7 if it's a string, otherwise use current time
-        ntime_raw  = job[7] if len(job) > 7 else None
-        ntime      = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
+        nbits         = job[6] if len(job) > 6 else '1e0fffff'
+        ntime_raw     = job[7] if len(job) > 7 else None
+        ntime         = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
 
         # Build coinbase
         coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -82,14 +89,14 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
                 hashlib.sha256(merkle_root + branch_bytes).digest()
             ).digest()
 
-        # Build 80-byte header
+        # Build 80-byte header using swap_endian_words (per 4-byte word swap)
         header = (
-            safe_hex(version, 4)[::-1] +
-            safe_hex(prevhash, 32)[::-1] +
-            merkle_root[::-1] +
-            safe_hex(ntime, 4)[::-1] +
-            safe_hex(nbits, 4)[::-1] +
-            struct.pack('<I', nonce)
+            swap_endian_words(version.zfill(8)) +    # version: swap per word
+            swap_endian_words(prevhash.zfill(64)) +   # prevhash: swap per word
+            merkle_root +                              # merkle root: raw bytes
+            swap_endian_words(ntime.zfill(8)) +       # ntime: swap per word
+            swap_endian_words(nbits.zfill(8)) +       # nbits: swap per word
+            struct.pack('<I', nonce)                   # nonce: little-endian
         )
         return header
     except Exception as e:
