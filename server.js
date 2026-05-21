@@ -5,18 +5,23 @@ const net = require('net');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Pool configuration
 const POOL_HOST = process.env.POOL_HOST || 'na.luckpool.net';
-const POOL_PORT = process.env.POOL_PORT || 3956;
+const POOL_PORT = parseInt(process.env.POOL_PORT || '3956');
+const NONCE_BATCH_SIZE = parseInt(process.env.NONCE_BATCH_SIZE || '56');
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
 // Active connections storage
 const connections = new Map();
 
-// Create Stratum connection
+// Global nonce counter (resets per job)
+let nonceState = {
+  jobId: null,
+  currentNonce: 0,
+  maxNonce: 0xFFFFFFFF
+};
+
 function createStratumConnection(workerId) {
   return new Promise((resolve, reject) => {
     const client = new net.Socket();
@@ -39,23 +44,26 @@ function createStratumConnection(workerId) {
 
     client.on('data', (data) => {
       const messages = data.toString().split('\n').filter(m => m.trim());
-      
       messages.forEach(msg => {
         try {
           const json = JSON.parse(msg);
-          console.log(`[${workerId}] Received:`, json);
-          
-          // Handle mining.notify
+          console.log(`[${workerId}] <<`, JSON.stringify(json));
+
           if (json.method === 'mining.notify') {
+            const newJobId = json.params[0];
+            // Reset nonce counter on new job
+            if (nonceState.jobId !== newJobId) {
+              nonceState.jobId = newJobId;
+              nonceState.currentNonce = 0;
+              console.log(`[nonce] New job ${newJobId}, reset nonce counter`);
+            }
             connection.job = json.params;
           }
-          
-          // Handle mining.set_difficulty
+
           if (json.method === 'mining.set_difficulty') {
             connection.difficulty = json.params[0];
           }
-          
-          // Handle responses
+
           if (json.id !== undefined) {
             connection.messageQueue.push(json);
           }
@@ -78,28 +86,23 @@ function createStratumConnection(workerId) {
   });
 }
 
-// Send JSON-RPC message
 function sendMessage(connection, method, params, id = Date.now()) {
   const message = JSON.stringify({ id, method, params }) + '\n';
   connection.socket.write(message);
-  console.log('Sent:', message.trim());
+  console.log('>>', message.trim());
   return id;
 }
 
-// Wait for response
 function waitForResponse(connection, id, timeout = 5000) {
   return new Promise((resolve, reject) => {
     const startTime = Date.now();
-    
     const checkResponse = setInterval(() => {
       const response = connection.messageQueue.find(msg => msg.id === id);
-      
       if (response) {
         connection.messageQueue = connection.messageQueue.filter(msg => msg.id !== id);
         clearInterval(checkResponse);
         resolve(response);
       }
-      
       if (Date.now() - startTime > timeout) {
         clearInterval(checkResponse);
         reject(new Error('Response timeout'));
@@ -113,27 +116,25 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     connections: connections.size,
-    pool: `${POOL_HOST}:${POOL_PORT}`
+    pool: `${POOL_HOST}:${POOL_PORT}`,
+    nonce_batch_size: NONCE_BATCH_SIZE,
+    current_job: nonceState.jobId,
+    current_nonce: nonceState.currentNonce
   });
 });
 
-// Subscribe to mining
+// Subscribe
 app.post('/subscribe', async (req, res) => {
   try {
     const { worker_id } = req.body;
-    
-    if (!worker_id) {
-      return res.status(400).json({ error: 'worker_id required' });
-    }
+    if (!worker_id) return res.status(400).json({ error: 'worker_id required' });
 
-    // Create or get connection
     let connection = connections.get(worker_id);
     if (!connection) {
       connection = await createStratumConnection(worker_id);
     }
 
-    // Subscribe
-    const subId = sendMessage(connection, 'mining.subscribe', ['miner/1.0.0']);
+    const subId = sendMessage(connection, 'mining.subscribe', ['rifaiminer/1.0.0']);
     const subResponse = await waitForResponse(connection, subId);
 
     if (subResponse.result) {
@@ -152,48 +153,34 @@ app.post('/subscribe', async (req, res) => {
   }
 });
 
-// Authorize worker
+// Authorize
 app.post('/authorize', async (req, res) => {
   try {
     const { worker_id, wallet_address, password = 'x' } = req.body;
-    
     if (!worker_id || !wallet_address) {
       return res.status(400).json({ error: 'worker_id and wallet_address required' });
     }
 
     const connection = connections.get(worker_id);
-    if (!connection) {
-      return res.status(400).json({ error: 'Not subscribed. Call /subscribe first' });
-    }
+    if (!connection) return res.status(400).json({ error: 'Not subscribed' });
 
-    // Authorize
     const authId = sendMessage(connection, 'mining.authorize', [wallet_address, password]);
     const authResponse = await waitForResponse(connection, authId);
 
     connection.authorized = authResponse.result === true;
-
-    res.json({
-      success: connection.authorized,
-      message: connection.authorized ? 'Authorized' : 'Authorization failed'
-    });
+    res.json({ success: connection.authorized });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get work
+// Get work + nonce batch
 app.post('/get_work', async (req, res) => {
   try {
     const { worker_id } = req.body;
-    
     const connection = connections.get(worker_id);
-    if (!connection) {
-      return res.status(400).json({ error: 'Not connected' });
-    }
-
-    if (!connection.authorized) {
-      return res.status(400).json({ error: 'Not authorized' });
-    }
+    if (!connection) return res.status(400).json({ error: 'Not connected' });
+    if (!connection.authorized) return res.status(400).json({ error: 'Not authorized' });
 
     // Wait for job
     let attempts = 0;
@@ -202,16 +189,29 @@ app.post('/get_work', async (req, res) => {
       attempts++;
     }
 
-    if (!connection.job) {
-      return res.status(500).json({ error: 'No job available' });
+    if (!connection.job) return res.status(500).json({ error: 'No job available' });
+
+    // Assign nonce batch to this worker
+    const nonceStart = nonceState.currentNonce;
+    const nonceEnd = Math.min(nonceStart + NONCE_BATCH_SIZE - 1, nonceState.maxNonce);
+    nonceState.currentNonce = nonceEnd + 1;
+
+    // Reset if exhausted
+    if (nonceState.currentNonce > nonceState.maxNonce) {
+      nonceState.currentNonce = 0;
     }
+
+    console.log(`[nonce] Assigned batch ${nonceStart.toString(16)}-${nonceEnd.toString(16)} to ${worker_id}`);
 
     res.json({
       success: true,
       job: connection.job,
       difficulty: connection.difficulty,
       extranonce1: connection.extranonce1,
-      extranonce2_size: connection.extranonce2_size
+      extranonce2_size: connection.extranonce2_size,
+      nonce_start: nonceStart,
+      nonce_end: nonceEnd,
+      batch_size: NONCE_BATCH_SIZE
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -222,15 +222,11 @@ app.post('/get_work', async (req, res) => {
 app.post('/submit', async (req, res) => {
   try {
     const { worker_id, job_id, extranonce2, ntime, nonce } = req.body;
-    
     const connection = connections.get(worker_id);
-    if (!connection) {
-      return res.status(400).json({ error: 'Not connected' });
-    }
+    if (!connection) return res.status(400).json({ error: 'Not connected' });
 
-    // Submit
     const submitId = sendMessage(connection, 'mining.submit', [
-      connection.extranonce1, // worker name (using extranonce1 as identifier)
+      connection.extranonce1,
       job_id,
       extranonce2,
       ntime,
@@ -238,11 +234,7 @@ app.post('/submit', async (req, res) => {
     ]);
 
     const submitResponse = await waitForResponse(connection, submitId);
-
-    res.json({
-      success: submitResponse.result === true,
-      error: submitResponse.error || null
-    });
+    res.json({ success: submitResponse.result === true, error: submitResponse.error || null });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -251,18 +243,16 @@ app.post('/submit', async (req, res) => {
 // Disconnect
 app.post('/disconnect', (req, res) => {
   const { worker_id } = req.body;
-  
   const connection = connections.get(worker_id);
   if (connection) {
     connection.socket.destroy();
     connections.delete(worker_id);
   }
-
   res.json({ success: true });
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(`Stratum HTTP Proxy running on port ${PORT}`);
   console.log(`Pool: ${POOL_HOST}:${POOL_PORT}`);
+  console.log(`Nonce batch size: ${NONCE_BATCH_SIZE}`);
 });
