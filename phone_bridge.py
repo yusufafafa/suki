@@ -31,7 +31,7 @@ PASSWORD  = 'x'
 # Cloudflare Worker URL
 WORKER_URL = os.environ.get('WORKER_URL', 'https://cord1-rifaiminer.adijayasukabumi.workers.dev')
 
-BATCH_SIZE = 100  # CF Worker 10ms CPU limit - keep small
+BATCH_SIZE = 56  # Match CF Worker CPU limit
 
 
 def hex_to_bytes(h):
