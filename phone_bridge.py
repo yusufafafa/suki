@@ -65,7 +65,9 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
         coinb2     = job[3] if len(job) > 3 else ''
         merkle_branch = job[4] if len(job) > 4 else []
         nbits      = job[6] if len(job) > 6 else '1e0fffff'
-        ntime      = job[7] if len(job) > 7 else '%08x' % int(time.time())
+        # ntime: index 7 if it's a string, otherwise use current time
+        ntime_raw  = job[7] if len(job) > 7 else None
+        ntime      = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
 
         # Build coinbase
         coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -216,11 +218,11 @@ class StratumClient:
     def handle_notify(self, params):
         """Handle new job from pool"""
         job_id = params[0]
-        clean = params[8] if len(params) > 8 else False
+        clean = params[8] if len(params) > 8 else (params[7] if len(params) > 7 and isinstance(params[7], bool) else False)
 
         if clean or self.current_job is None or self.current_job[0] != job_id:
             log.info(f'[!] NEW JOB: {job_id} (clean={clean})')
-            log.info(f'[!] Job fields: version={params[5] if len(params)>5 else "?"} nbits={params[6] if len(params)>6 else "?"} ntime={params[7] if len(params)>7 else "?"}')
+            log.info(f'[!] Job fields count={len(params)}: version={params[5] if len(params)>5 else "?"} nbits={params[6] if len(params)>6 else "?"} ntime={params[7] if len(params)>7 else "?"}')
             self.current_job = params
             with self.nonce_lock:
                 self.nonce_counter = 0
