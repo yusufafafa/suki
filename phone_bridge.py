@@ -42,38 +42,56 @@ def bytes_to_hex(b):
     return b.hex()
 
 
+def safe_hex(h, length=0):
+    """Safely convert hex string, pad or truncate to length bytes"""
+    if not h:
+        return bytes(length)
+    try:
+        b = bytes.fromhex(h)
+        if length and len(b) < length:
+            b = b + bytes(length - len(b))
+        return b[:length] if length else b
+    except Exception:
+        return bytes(length)
+
+
 def build_header(job, extranonce1, extranonce2, nonce=0):
     """Build 80-byte block header from stratum job"""
     # job = [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean]
-    version    = job[5]
-    prevhash   = job[1]
-    coinb1     = job[2]
-    coinb2     = job[3]
-    merkle_branch = job[4]
-    nbits      = job[6]
-    ntime      = job[7]
+    try:
+        version    = job[5] if len(job) > 5 else '00000001'
+        prevhash   = job[1] if len(job) > 1 else '00' * 32
+        coinb1     = job[2] if len(job) > 2 else ''
+        coinb2     = job[3] if len(job) > 3 else ''
+        merkle_branch = job[4] if len(job) > 4 else []
+        nbits      = job[6] if len(job) > 6 else '1e0fffff'
+        ntime      = job[7] if len(job) > 7 else '%08x' % int(time.time())
 
-    # Build coinbase
-    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
-    coinbase_hash = hashlib.sha256(hashlib.sha256(bytes.fromhex(coinbase)).digest()).digest()
+        # Build coinbase
+        coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+        coinbase_bytes = safe_hex(coinbase)
+        coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase_bytes).digest()).digest()
 
-    # Build merkle root
-    merkle_root = coinbase_hash
-    for branch in merkle_branch:
-        merkle_root = hashlib.sha256(
-            hashlib.sha256(merkle_root + bytes.fromhex(branch)).digest()
-        ).digest()
+        # Build merkle root
+        merkle_root = coinbase_hash
+        for branch in merkle_branch:
+            branch_bytes = safe_hex(branch, 32)
+            merkle_root = hashlib.sha256(
+                hashlib.sha256(merkle_root + branch_bytes).digest()
+            ).digest()
 
-    # Build 80-byte header
-    header = (
-        bytes.fromhex(version)[::-1] +   # version LE
-        bytes.fromhex(prevhash)[::-1] +   # prevhash LE
-        merkle_root[::-1] +               # merkle root LE
-        bytes.fromhex(ntime)[::-1] +      # ntime LE
-        bytes.fromhex(nbits)[::-1] +      # nbits LE
-        struct.pack('<I', nonce)           # nonce LE
-    )
-    return header
+        # Build 80-byte header
+        header = (
+            safe_hex(version, 4)[::-1] +
+            safe_hex(prevhash, 32)[::-1] +
+            merkle_root[::-1] +
+            safe_hex(ntime, 4)[::-1] +
+            safe_hex(nbits, 4)[::-1] +
+            struct.pack('<I', nonce)
+        )
+        return header
+    except Exception as e:
+        raise ValueError(f'Header build failed: {e}')
 
 
 def compute_target(difficulty):
@@ -202,9 +220,10 @@ class StratumClient:
 
         if clean or self.current_job is None or self.current_job[0] != job_id:
             log.info(f'[!] NEW JOB: {job_id} (clean={clean})')
+            log.info(f'[!] Job fields: version={params[5] if len(params)>5 else "?"} nbits={params[6] if len(params)>6 else "?"} ntime={params[7] if len(params)>7 else "?"}')
             self.current_job = params
             with self.nonce_lock:
-                self.nonce_counter = 0  # Reset nonce on new job
+                self.nonce_counter = 0
 
     def mine_job(self):
         """Mine current job - offload to Worker"""
