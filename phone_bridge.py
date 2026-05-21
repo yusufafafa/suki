@@ -117,6 +117,15 @@ class StratumClient:
         self.nonce_counter = 0
         self.nonce_lock = threading.Lock()
         self.running = False
+        # Stats
+        self.stats = {
+            'jobs': 0,
+            'submitted': 0,
+            'accepted': 0,
+            'rejected': 0,
+            'hashes': 0,
+            'start_time': time.time()
+        }
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -202,6 +211,7 @@ class StratumClient:
 
     def submit_share(self, job_id, extranonce2, ntime, nonce_hex):
         """Submit winning share to pool"""
+        self.stats['submitted'] += 1
         self.send('mining.submit', [
             f'{WALLET}.{WORKER}',
             job_id,
@@ -211,9 +221,11 @@ class StratumClient:
         ])
         resp = self.recv_response()
         if resp.get('result'):
-            log.info(f'[!!!] SHARE ACCEPTED! nonce={nonce_hex}')
+            self.stats['accepted'] += 1
+            print(f'[!!!] SHARE ACCEPTED! nonce={nonce_hex}')
         else:
-            log.warning(f'Share rejected: {resp}')
+            self.stats['rejected'] += 1
+            print(f'Share rejected: {resp}')
 
     def handle_notify(self, params):
         """Handle new job from pool"""
@@ -221,8 +233,8 @@ class StratumClient:
         clean = params[8] if len(params) > 8 else (params[7] if len(params) > 7 and isinstance(params[7], bool) else False)
 
         if clean or self.current_job is None or self.current_job[0] != job_id:
-            log.info(f'[!] NEW JOB: {job_id} (clean={clean})')
-            log.info(f'[!] Job fields count={len(params)}: version={params[5] if len(params)>5 else "?"} nbits={params[6] if len(params)>6 else "?"} ntime={params[7] if len(params)>7 else "?"}')
+            self.stats['jobs'] += 1
+            print(f'\nNEW JOB RECEIVED: Job ID {job_id}')
             self.current_job = params
             with self.nonce_lock:
                 self.nonce_counter = 0
@@ -234,7 +246,8 @@ class StratumClient:
 
         job = self.current_job
         job_id = job[0]
-        ntime = job[7]
+        ntime_raw = job[7] if len(job) > 7 else None
+        ntime = ntime_raw if isinstance(ntime_raw, str) else '%08x' % int(time.time())
         extranonce2 = '00' * self.extranonce2_size
 
         # Build header
@@ -251,15 +264,23 @@ class StratumClient:
         # Get nonce batch
         nonce_start, nonce_end = self.get_next_nonce_batch(job_id)
 
-        log.info(f'Offloading to Worker: job={job_id} nonce={hex(nonce_start)}-{hex(nonce_end)}')
+        print(f'Sending nonce range to Cloudflare Worker...')
 
         # Send to Cloudflare Worker
         result = self.offload_to_worker(header_hex, target, nonce_start)
+        self.stats['hashes'] += BATCH_SIZE
+
+        # Calculate hashrate
+        elapsed = time.time() - self.stats['start_time']
+        hashrate = self.stats['hashes'] / elapsed if elapsed > 0 else 0
 
         if result and result.get('found'):
             nonce_hex = result['nonce_hex']
-            log.info(f'[!!!] SHARE FOUND! nonce={nonce_hex} hash={result.get("hash", "")[:16]}...')
+            print(f'[!!!] SHARE FOUND! nonce={nonce_hex}')
             self.submit_share(job_id, extranonce2, ntime, nonce_hex)
+        else:
+            s = self.stats
+            print(f'Checked {BATCH_SIZE} hashes. No share found. [{hashrate:.2f} H/s | jobs={s["jobs"]} | submitted={s["submitted"]} | accepted={s["accepted"]} | rejected={s["rejected"]}]')
 
     def run(self):
         """Main mining loop"""
