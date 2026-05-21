@@ -265,6 +265,8 @@ class StratumClient:
         nonce_start, nonce_end = self.get_next_nonce_batch(job_id)
 
         print(f'Sending nonce range to Cloudflare Worker...')
+        if self.stats['jobs'] <= 2:  # Debug first 2 jobs only
+            print(f'[DEBUG] difficulty={self.difficulty} target={target[:16]}...')
 
         # Send to Cloudflare Worker
         result = self.offload_to_worker(header_hex, target, nonce_start)
