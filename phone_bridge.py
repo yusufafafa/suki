@@ -31,7 +31,7 @@ PASSWORD  = 'x'
 # Cloudflare Worker URL
 WORKER_URL = os.environ.get('WORKER_URL', 'https://cord1-rifaiminer.adijayasukabumi.workers.dev')
 
-BATCH_SIZE = 56
+BATCH_SIZE = 1000  # Increase batch size for better share finding
 
 
 def hex_to_bytes(h):
