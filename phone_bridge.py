@@ -67,36 +67,25 @@ def safe_hex(h, length=0):
 def build_header(job, extranonce1, extranonce2, nonce=0):
     """Build 80-byte block header from Luckpool stratum job
     
-    Luckpool format (from debug):
+    Luckpool actual format (verified from debug):
     params[0] = job_id
-    params[1] = version (e.g. '04000100')
-    params[2] = prevhash (64 hex chars)
+    params[1] = version   (e.g. '04000100')
+    params[2] = prevhash  (64 hex chars)
     params[3] = coinb1
     params[4] = merkle_branch (list)
-    params[5] = coinb2
-    params[6] = nbits
+    params[5] = ntime     (e.g. '44ef0e6a')
+    params[6] = nbits     (e.g. '9490041b')
     params[7] = clean_jobs (bool)
-    params[8] = ntime (or extra data)
+    params[8] = coinb2 or extra data
     """
     try:
         version       = job[1] if len(job) > 1 else '00000004'
         prevhash      = job[2] if len(job) > 2 else '00' * 32
         coinb1        = job[3] if len(job) > 3 else ''
         merkle_branch = job[4] if len(job) > 4 else []
-        coinb2        = job[5] if len(job) > 5 else ''
-        nbits         = job[6] if len(job) > 6 else '1e0fffff'
-        # ntime: look for string value after clean_jobs bool
-        ntime = None
-        for p in job[7:]:
-            if isinstance(p, str) and len(p) == 8:
-                try:
-                    int(p, 16)
-                    ntime = p
-                    break
-                except ValueError:
-                    pass
-        if not ntime:
-            ntime = '%08x' % int(time.time())
+        ntime         = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
+        nbits         = job[6] if len(job) > 6 and isinstance(job[6], str) else '1e0fffff'
+        coinb2        = job[8] if len(job) > 8 and isinstance(job[8], str) else ''
 
         # Build coinbase
         coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -111,7 +100,7 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
                 hashlib.sha256(merkle_root + branch_bytes).digest()
             ).digest()
 
-        # Build 80-byte header using swap_endian_words
+        # Build 80-byte header
         header = (
             swap_endian_words(version.zfill(8)) +
             swap_endian_words(prevhash.zfill(64)) +
@@ -288,19 +277,8 @@ class StratumClient:
         job = self.current_job
         job_id = job[0]
         extranonce2 = '00' * self.extranonce2_size
-
-        # Find ntime - look for 8-char hex string after index 6
-        ntime = None
-        for p in job[7:]:
-            if isinstance(p, str) and len(p) == 8:
-                try:
-                    int(p, 16)
-                    ntime = p
-                    break
-                except ValueError:
-                    pass
-        if not ntime:
-            ntime = '%08x' % int(time.time())
+        # ntime is at params[5] in Luckpool format
+        ntime = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
 
         # Build header
         try:
