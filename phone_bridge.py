@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Phone Bridge - VerusCoin Mining
-Connects to Luckpool via TCP Stratum
-Offloads hashing to Cloudflare Worker
+Based on ccminer-verus Oink70/Verus2.2 equi-stratum.cpp
+
+Flow:
+1. Connect to pool via TCP Stratum
+2. Receive job (140-byte header + 1344-byte solution from pool)
+3. Offload hash check to Cloudflare Worker
+4. Submit valid shares back to pool
 """
 
 import socket
@@ -28,173 +33,134 @@ WALLET    = 'RGobnkLhYLPPxTeFuprGEw8WcdcHNULiSq'
 WORKER    = 'cord1'
 PASSWORD  = 'x'
 
-# Cloudflare Worker URL
 WORKER_URL = os.environ.get('WORKER_URL', 'https://cord1-rifaiminer.adijayasukabumi.workers.dev')
 
-BATCH_SIZE = 56  # Match CF Worker CPU limit
+BATCH_SIZE = 56
 
 
-def hex_to_bytes(h):
-    return bytes.fromhex(h)
+def swab32(x):
+    """Swap bytes of a 32-bit integer (like ccminer swab32)"""
+    return struct.unpack('>I', struct.pack('<I', x & 0xFFFFFFFF))[0]
 
 
-def bytes_to_hex(b):
-    return b.hex()
+def le32dec(b, offset=0):
+    """Read little-endian uint32 from bytes"""
+    return struct.unpack_from('<I', b, offset)[0]
 
 
-def swap_endian_words(hex_words):
-    """Swap endianness per 4-byte word (as used in stratum protocol)"""
-    b = bytes.fromhex(hex_words)
-    if len(b) % 4 != 0:
-        # Pad to 4-byte boundary
-        b = b + bytes(4 - len(b) % 4)
-    return b''.join([b[4*i:4*i+4][::-1] for i in range(len(b)//4)])
+def be32dec(b, offset=0):
+    """Read big-endian uint32 from bytes"""
+    return struct.unpack_from('>I', b, offset)[0]
 
 
-def safe_hex(h, length=0):
-    """Safely convert hex string, pad or truncate to length bytes"""
-    if not h:
-        return bytes(length)
-    try:
-        b = bytes.fromhex(h)
-        if length and len(b) < length:
-            b = b + bytes(length - len(b))
-        return b[:length] if length else b
-    except Exception:
-        return bytes(length)
-
-
-def build_header(job, extranonce1, extranonce2, nonce=0):
-    """Build 80-byte block header - matches ccminer stratum_gen_work()
-    
-    From ccminer cpu-miner.c stratum_gen_work():
-    work->data[0]    = le32dec(version)
-    work->data[1..8] = le32dec(prevhash[i])   -- prevhash as 8 LE uint32
-    work->data[9..16]= be32dec(merkle_root[i]) -- merkle as 8 BE uint32
-    work->data[17]   = le32dec(ntime)
-    work->data[18]   = le32dec(nbits)
-    work->data[19]   = nonce (LE)
-    
-    Luckpool format (verified from debug):
-    params[0] = job_id
-    params[1] = version   (4 bytes hex)
-    params[2] = prevhash  (64 hex chars)
-    params[3] = coinb1
-    params[4] = merkle_branch (list)
-    params[5] = ntime     (8 hex chars)
-    params[6] = nbits     (8 hex chars)
-    params[7] = clean_jobs (bool)
-    params[8] = coinb2
+def build_header_140(job, extranonce1, extranonce2):
     """
-    try:
-        version       = job[1] if len(job) > 1 and isinstance(job[1], str) else '00000004'
-        prevhash      = job[2] if len(job) > 2 and isinstance(job[2], str) else '00' * 32
-        coinb1        = job[3] if len(job) > 3 and isinstance(job[3], str) else ''
-        merkle_branch = job[4] if len(job) > 4 and isinstance(job[4], list) else []
-        ntime         = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
-        nbits         = job[6] if len(job) > 6 and isinstance(job[6], str) else '1e0fffff'
-        coinb2        = job[8] if len(job) > 8 and isinstance(job[8], str) else ''
-
-        # Build coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
-        coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
-        coinbase_bytes = bytes.fromhex(coinbase) if coinbase else b''
-        coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase_bytes).digest()).digest()
-
-        # Build merkle root (sha256d)
-        merkle_root = coinbase_hash
-        for branch in merkle_branch:
-            branch_bytes = bytes.fromhex(branch) if branch else b'\x00' * 32
-            merkle_root = hashlib.sha256(
-                hashlib.sha256(merkle_root + branch_bytes).digest()
-            ).digest()
-
-        # Build header as 20 uint32 words (matches ccminer work->data[])
-        # data[0]: version as LE uint32
-        # data[1..8]: prevhash as 8 LE uint32 words
-        # data[9..16]: merkle_root as 8 BE uint32 words
-        # data[17]: ntime as LE uint32
-        # data[18]: nbits as LE uint32
-        # data[19]: nonce as LE uint32
-
-        header = bytearray(80)
-
-        # version (LE)
-        v = bytes.fromhex(version.zfill(8))
-        struct.pack_into('<I', header, 0, struct.unpack('>I', v)[0])
-
-        # prevhash: 8 LE uint32 words
-        ph = bytes.fromhex(prevhash.zfill(64))
-        for i in range(8):
-            word = struct.unpack('>I', ph[i*4:(i+1)*4])[0]
-            struct.pack_into('<I', header, 4 + i*4, word)
-
-        # merkle root: 8 BE uint32 words
-        for i in range(8):
-            word = struct.unpack('>I', merkle_root[i*4:(i+1)*4])[0]
-            struct.pack_into('>I', header, 36 + i*4, word)
-
-        # ntime (LE)
-        nt = bytes.fromhex(ntime.zfill(8))
-        struct.pack_into('<I', header, 68, struct.unpack('>I', nt)[0])
-
-        # nbits (LE)
-        nb = bytes.fromhex(nbits.zfill(8))
-        struct.pack_into('<I', header, 72, struct.unpack('>I', nb)[0])
-
-        # nonce (LE)
-        struct.pack_into('<I', header, 76, nonce)
-
-        return bytes(header)
-    except Exception as e:
-        raise ValueError(f'Header build failed: {e}')
-
-
-def compute_target(difficulty):
-    """Convert difficulty to 32-byte target - matches ccminer diff_to_target()
+    Build 140-byte VerusCoin block header from stratum job.
     
-    From ccminer util.c:
+    Based on ccminer equi_stratum_notify + stratum_gen_work:
+    
+    Luckpool job format (from equi_stratum_notify):
+    params[0] = job_id
+    params[1] = version   (8 hex chars = 4 bytes)
+    params[2] = prevhash  (64 hex chars = 32 bytes)
+    params[3] = coinb1    (merkle, 64 hex chars = 32 bytes)
+    params[4] = coinb2    (reserved, 64 hex chars = 32 bytes)
+    params[5] = stime     (8 hex chars = 4 bytes, ntime)
+    params[6] = nbits     (8 hex chars = 4 bytes)
+    params[7] = clean     (bool)
+    params[8] = solution  (2688 hex chars = 1344 bytes)
+    
+    Header layout (140 bytes):
+    [0:4]    version (LE)
+    [4:36]   prevhash (32 bytes, as-is from pool)
+    [36:68]  merkle/coinb1 (32 bytes, as-is)
+    [68:100] coinb2/reserved (32 bytes, as-is)
+    [100:104] ntime (LE)
+    [104:108] nbits (LE)
+    [108:140] nonce (32 bytes, extranonce1 + extranonce2 + zeros)
+    """
+    version  = job[1] if len(job) > 1 and isinstance(job[1], str) else '00000004'
+    prevhash = job[2] if len(job) > 2 and isinstance(job[2], str) else '00' * 32
+    coinb1   = job[3] if len(job) > 3 and isinstance(job[3], str) else '00' * 32
+    coinb2   = job[4] if len(job) > 4 and isinstance(job[4], str) else '00' * 32
+    stime    = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
+    nbits    = job[6] if len(job) > 6 and isinstance(job[6], str) else '1e0fffff'
+
+    header = bytearray(140)
+
+    # version (4 bytes LE) - hex2bin then store as-is (pool sends LE already)
+    v = bytes.fromhex(version.zfill(8))
+    header[0:4] = v
+
+    # prevhash (32 bytes) - hex2bin as-is
+    header[4:36] = bytes.fromhex(prevhash.zfill(64))
+
+    # coinb1/merkle (32 bytes) - hex2bin as-is
+    header[36:68] = bytes.fromhex(coinb1.zfill(64))
+
+    # coinb2/reserved (32 bytes) - hex2bin as-is
+    header[68:100] = bytes.fromhex(coinb2.zfill(64))
+
+    # ntime (4 bytes LE)
+    nt = bytes.fromhex(stime.zfill(8))
+    header[100:104] = nt
+
+    # nbits (4 bytes LE)
+    nb = bytes.fromhex(nbits.zfill(8))
+    header[104:108] = nb
+
+    # nonce (32 bytes): extranonce1 (pool prefix) + extranonce2 + zeros
+    nonce = bytearray(32)
+    en1 = bytes.fromhex(extranonce1) if extranonce1 else b''
+    en2 = bytes.fromhex(extranonce2) if extranonce2 else b''
+    nonce[:len(en1)] = en1
+    nonce[len(en1):len(en1)+len(en2)] = en2
+    header[108:140] = nonce
+
+    return bytes(header)
+
+
+def compute_target_from_diff(difficulty):
+    """
+    Convert difficulty to 32-byte target.
+    Based on diff_to_target_equi from equi-stratum.cpp:
+    
     for (k = 6; k > 0 && diff > 1.0; k--)
         diff /= 4294967296.0;
     m = (uint64_t)(4294901760.0 / diff);
-    target[k] = m; target[k+1] = m >> 32;
+    target[k+1] = m >> 8
+    target[k+2] = m >> 40
+    then fill leading bytes with 0xff
     """
     if not difficulty or difficulty <= 0:
         difficulty = 1.0
-    
+
     diff = float(difficulty)
     k = 6
     while k > 0 and diff > 1.0:
         diff /= 4294967296.0
         k -= 1
-    
+
     m = int(4294901760.0 / diff)
-    
+
     target = bytearray(32)
-    # target[k] = lower 32 bits, target[k+1] = upper 32 bits (little-endian uint32 array)
-    struct.pack_into('<I', target, k * 4, m & 0xFFFFFFFF)
-    if k + 1 < 8:
-        struct.pack_into('<I', target, (k + 1) * 4, (m >> 32) & 0xFFFFFFFF)
-    
-    return target.hex()
+    if m == 0 and k == 6:
+        # fill with 0xff
+        for i in range(32):
+            target[i] = 0xff
+    else:
+        # target[k+1] = m >> 8 (lower 32 bits of m>>8)
+        struct.pack_into('<I', target, (k + 1) * 4, (m >> 8) & 0xFFFFFFFF)
+        # target[k+2] = m >> 40 (lower 32 bits of m>>40)
+        if k + 2 < 8:
+            struct.pack_into('<I', target, (k + 2) * 4, (m >> 40) & 0xFFFFFFFF)
+        # fill leading bytes with 0xff
+        i = 0
+        while i < 28 and target[i] == 0:
+            target[i] = 0xff
+            i += 1
 
-
-def nbits_to_target(nbits_hex):
-    """Convert nbits to 32-byte target (big-endian hex)"""
-    try:
-        nbits = int(nbits_hex, 16)
-        exponent = (nbits >> 24) & 0xFF
-        mantissa = nbits & 0x7FFFFF
-        # target = mantissa * 2^(8*(exponent-3))
-        shift = 8 * (exponent - 3)
-        if shift >= 0:
-            target_int = mantissa << shift
-        else:
-            target_int = mantissa >> (-shift)
-        # Clamp to 256 bits
-        target_int = min(target_int, 2**256 - 1)
-        return target_int.to_bytes(32, 'big').hex()
-    except Exception:
-        return None
+    return bytes(target).hex()
 
 
 class StratumClient:
@@ -202,14 +168,15 @@ class StratumClient:
         self.sock = None
         self.buf = ''
         self.msg_id = 0
-        self.extranonce1 = None
+        self.extranonce1 = ''
+        self.extranonce1_size = 0
         self.extranonce2_size = 4
-        self.difficulty = 1
+        self.difficulty = 1.0
+        self.target_hex = None
         self.current_job = None
         self.nonce_counter = 0
         self.nonce_lock = threading.Lock()
         self.running = False
-        # Stats
         self.stats = {
             'jobs': 0,
             'submitted': 0,
@@ -249,7 +216,7 @@ class StratumClient:
                 continue
             try:
                 msg = json.loads(line)
-                log.info(f'<< {line[:150]}')
+                log.info(f'<< {line[:200]}')
                 return msg
             except json.JSONDecodeError:
                 continue
@@ -258,11 +225,10 @@ class StratumClient:
         self.send('mining.subscribe', ['phone_bridge/1.0.0'])
         resp = self.recv_response()
         result = resp.get('result')
-        if result:
-            # Luckpool returns [null, extranonce1] or [subscriptions, extranonce1, extranonce2_size]
-            if isinstance(result, list) and len(result) >= 2:
-                self.extranonce1 = result[1] if result[1] else result[0]
-                self.extranonce2_size = result[2] if len(result) > 2 else 4
+        if result and isinstance(result, list) and len(result) >= 2:
+            self.extranonce1 = result[1] if result[1] else ''
+            self.extranonce1_size = len(bytes.fromhex(self.extranonce1)) if self.extranonce1 else 0
+            self.extranonce2_size = result[2] if len(result) > 2 and result[2] else 4
             log.info(f'Subscribed. extranonce1={self.extranonce1} extranonce2_size={self.extranonce2_size}')
 
     def authorize(self):
@@ -273,8 +239,27 @@ class StratumClient:
         else:
             log.error(f'Authorization failed: {resp}')
 
-    def get_next_nonce_batch(self, job_id):
-        """Get next nonce batch, reset on new job"""
+    def handle_notify(self, params):
+        """Handle mining.notify - store job"""
+        job_id = params[0]
+        clean = params[7] if len(params) > 7 and isinstance(params[7], bool) else False
+
+        if clean or self.current_job is None or self.current_job[0] != job_id:
+            self.stats['jobs'] += 1
+            print(f'\nNEW JOB RECEIVED: Job ID {job_id}')
+            self.current_job = params
+            with self.nonce_lock:
+                self.nonce_counter = 0
+
+    def handle_set_target(self, params):
+        """Handle mining.set_target - store target directly from pool"""
+        target_hex = params[0] if params else None
+        if target_hex:
+            self.target_hex = target_hex
+            log.info(f'Target set: {target_hex[:16]}...')
+
+    def get_nonce_batch(self):
+        """Get next nonce batch"""
         with self.nonce_lock:
             start = self.nonce_counter
             end = start + BATCH_SIZE - 1
@@ -283,16 +268,21 @@ class StratumClient:
                 self.nonce_counter = 0
         return start, end
 
-    def offload_to_worker(self, header_hex, target, nonce_start):
+    def offload_to_worker(self, header_hex, solution_hex, target_hex, nonce_start):
         """Send hash request to Cloudflare Worker"""
         try:
+            # Full data = header (140 bytes) + sol_size (3 bytes fd4005) + solution (1344 bytes)
+            sol_size_header = 'fd4005'
+            full_data_hex = header_hex + sol_size_header + solution_hex
+
             resp = requests.post(
                 f'{WORKER_URL}/hash',
                 json={
-                    'header_hex': header_hex,
-                    'target': target,
+                    'header_hex': full_data_hex,
+                    'target': target_hex,
                     'nonce_start': nonce_start,
-                    'batch_size': BATCH_SIZE
+                    'batch_size': BATCH_SIZE,
+                    'nonce_offset': 108 * 2  # nonce at byte 108 in header
                 },
                 timeout=30
             )
@@ -300,22 +290,47 @@ class StratumClient:
                 print(f'[ERROR] Worker HTTP {resp.status_code}: {resp.text[:100]}')
                 return None
             return resp.json()
-        except requests.exceptions.JSONDecodeError as e:
-            print(f'[ERROR] Worker JSON parse failed: {resp.text[:100]}')
+        except requests.exceptions.JSONDecodeError:
+            print(f'[ERROR] Worker JSON parse failed')
             return None
         except Exception as e:
             print(f'[ERROR] Worker request failed: {e}')
             return None
 
-    def submit_share(self, job_id, ntime, nonce_hex, sol_hex):
-        """Submit winning share to pool - VerusCoin equihash format"""
+    def submit_share(self, job_id, ntime_hex, nonce_hex, sol_hex):
+        """
+        Submit share to pool.
+        
+        From equi_stratum_submit:
+        params = [user, job_id, timehex, noncestr, solhex]
+        - timehex = swab32(ntime) = ntime bytes reversed
+        - noncestr = nonce bytes AFTER extranonce1 prefix
+        - solhex = 1347 bytes (3 bytes size + 1344 bytes solution)
+        """
         self.stats['submitted'] += 1
-        # VerusCoin submit: [user, job_id, ntime, nonce, solution]
+
+        # timehex = swab32(ntime) - reverse the 4 bytes
+        try:
+            ntime_int = int(ntime_hex, 16)
+            timehex = '%08x' % swab32(ntime_int)
+        except Exception:
+            timehex = ntime_hex
+
+        # noncestr = nonce without extranonce1 prefix
+        # nonce is 32 bytes, extranonce1 is first N bytes
+        # noncestr = remaining bytes after extranonce1
+        nonce_bytes = bytes.fromhex(nonce_hex.zfill(64))  # 32 bytes
+        noncestr = nonce_bytes[self.extranonce1_size:].hex()
+
+        # job_id: ccminer uses job_id + 8 chars offset, but we use full job_id
+        # Some pools want short job_id, try both
+        short_job_id = job_id[8:] if len(job_id) > 8 else job_id
+
         self.send('mining.submit', [
             f'{WALLET}.{WORKER}',
-            job_id,
-            ntime,
-            nonce_hex,
+            short_job_id,
+            timehex,
+            noncestr,
             sol_hex
         ])
         resp = self.recv_response()
@@ -324,85 +339,76 @@ class StratumClient:
             print(f'[!!!] SHARE ACCEPTED! nonce={nonce_hex}')
         else:
             self.stats['rejected'] += 1
-            print(f'Share rejected: {resp}')
-
-    def handle_notify(self, params):
-        """Handle new job from pool"""
-        job_id = params[0]
-        clean = params[8] if len(params) > 8 else (params[7] if len(params) > 7 and isinstance(params[7], bool) else False)
-
-        if clean or self.current_job is None or self.current_job[0] != job_id:
-            self.stats['jobs'] += 1
-            print(f'\nNEW JOB RECEIVED: Job ID {job_id}')
-            if self.stats['jobs'] <= 2:
-                for i, p in enumerate(params):
-                    val = str(p)[:40] if isinstance(p, str) else str(p)
-                    print(f'[DEBUG] params[{i}] = {val}')
-            self.current_job = params
-            with self.nonce_lock:
-                self.nonce_counter = 0
+            err = resp.get('error', 'unknown')
+            print(f'Share rejected: {err}')
+            # Try with full job_id if short failed
+            if 'job' in str(err).lower() or 'stale' in str(err).lower():
+                log.info('Retrying with full job_id...')
+                self.send('mining.submit', [
+                    f'{WALLET}.{WORKER}',
+                    job_id,
+                    timehex,
+                    noncestr,
+                    sol_hex
+                ])
+                resp2 = self.recv_response()
+                if resp2.get('result'):
+                    self.stats['accepted'] += 1
+                    self.stats['rejected'] -= 1
+                    print(f'[!!!] SHARE ACCEPTED (retry)! nonce={nonce_hex}')
 
     def mine_job(self):
-        """Mine current job - offload to Worker"""
+        """Mine current job"""
         if not self.current_job:
             return
 
         job = self.current_job
-        job_id = job[0]
-        # Luckpool format: [job_id, version, prevhash, coinb1, coinb2, ntime, nbits, clean, solution]
+        job_id  = job[0]
         ntime   = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
         solution = job[8] if len(job) > 8 and isinstance(job[8], str) else None
 
-        # Build 140-byte header (VerusCoin uses 140 bytes, not 80)
+        if not solution or len(solution) != 2688:
+            # No valid solution from pool, skip
+            return
+
+        # Build 140-byte header
+        extranonce2 = '00' * self.extranonce2_size
         try:
-            header = build_header(job, self.extranonce1, '00' * self.extranonce2_size)
+            header = build_header_140(job, self.extranonce1, extranonce2)
             header_hex = header.hex()
-            if self.stats['jobs'] <= 1:
-                print(f'[DEBUG] Header ({len(header)} bytes): {header_hex[:40]}...')
         except Exception as e:
             log.error(f'Header build failed: {e}')
             return
 
-        # Get target from nbits
-        nbits = job[6] if len(job) > 6 and isinstance(job[6], str) else None
-        if nbits:
-            target = nbits_to_target(nbits) or compute_target(self.difficulty)
+        # Get target
+        if self.target_hex:
+            target = self.target_hex
         else:
-            target = compute_target(self.difficulty)
+            target = compute_target_from_diff(self.difficulty)
 
         # Get nonce batch
-        nonce_start, nonce_end = self.get_next_nonce_batch(job_id)
+        nonce_start, _ = self.get_nonce_batch()
 
         print(f'Sending nonce range to Cloudflare Worker...')
 
-        # Build full data: header + solution_size_header + solution
-        # solution_size_header = 0xfd4005 (little-endian for 1344)
-        if solution and len(solution) == 2688:  # 1344 bytes * 2 hex chars
-            sol_size_header = 'fd4005'  # 0x0540fd in LE = 1344
-            full_data_hex = header_hex + sol_size_header + solution
-        else:
-            full_data_hex = header_hex
-
-        # Send to Cloudflare Worker
-        result = self.offload_to_worker(full_data_hex, target, nonce_start)
+        # Offload to Worker
+        result = self.offload_to_worker(header_hex, solution, target, nonce_start)
         self.stats['hashes'] += BATCH_SIZE
 
-        # Calculate hashrate
         elapsed = time.time() - self.stats['start_time']
         hashrate = self.stats['hashes'] / elapsed if elapsed > 0 else 0
 
         if result and result.get('found'):
             nonce_hex = result['nonce_hex']
             print(f'[!!!] SHARE FOUND! nonce={nonce_hex}')
-            # Build solution hex for submit
-            sol_hex = sol_size_header + solution if solution else '00' * 1347
+            # sol_hex = size_header + solution
+            sol_hex = 'fd4005' + solution
             self.submit_share(job_id, ntime, nonce_hex, sol_hex)
         else:
             s = self.stats
             print(f'Checked {BATCH_SIZE} hashes. No share found. [{hashrate:.2f} H/s | jobs={s["jobs"]} | submitted={s["submitted"]} | accepted={s["accepted"]} | rejected={s["rejected"]}]')
 
     def run(self):
-        """Main mining loop"""
         self.connect()
         self.subscribe()
         self.authorize()
@@ -412,7 +418,6 @@ class StratumClient:
 
         while self.running:
             try:
-                # Check for pool messages (non-blocking)
                 self.sock.settimeout(0.1)
                 try:
                     line = self.recv_line()
@@ -422,15 +427,14 @@ class StratumClient:
 
                         if method == 'mining.notify':
                             self.handle_notify(msg['params'])
-
                         elif method == 'mining.set_difficulty':
                             self.difficulty = msg['params'][0]
                             log.info(f'Difficulty: {self.difficulty}')
-
+                        elif method == 'mining.set_target':
+                            self.handle_set_target(msg['params'])
                 except socket.timeout:
                     pass
 
-                # Mine current job
                 self.sock.settimeout(60)
                 self.mine_job()
 
@@ -441,9 +445,12 @@ class StratumClient:
                 log.error(f'Error: {e}')
                 time.sleep(5)
                 log.info('Reconnecting...')
-                self.connect()
-                self.subscribe()
-                self.authorize()
+                try:
+                    self.connect()
+                    self.subscribe()
+                    self.authorize()
+                except Exception as e2:
+                    log.error(f'Reconnect failed: {e2}')
 
 
 if __name__ == '__main__':
