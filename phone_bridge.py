@@ -115,14 +115,28 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
 
 
 def compute_target(difficulty):
-    """Convert difficulty to 32-byte target hex (big-endian)"""
+    """Convert difficulty to 32-byte target hex (big-endian)
+    
+    ccminer uses: target = diff1 / difficulty
+    where diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    """
     if not difficulty or difficulty <= 0:
         difficulty = 1
-    # VerusCoin target calculation
-    # diff1 target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     target = int(diff1 / difficulty)
     return target.to_bytes(32, 'big').hex()
+
+
+def nbits_to_target(nbits_hex):
+    """Convert nbits to target (alternative to difficulty-based target)"""
+    try:
+        nbits = int(nbits_hex, 16)
+        exponent = nbits >> 24
+        mantissa = nbits & 0xFFFFFF
+        target = mantissa * (2 ** (8 * (exponent - 3)))
+        return target.to_bytes(32, 'big').hex()
+    except Exception:
+        return None
 
 
 class StratumClient:
@@ -291,8 +305,12 @@ class StratumClient:
             log.error(f'Header build failed: {e}')
             return
 
-        # Get target
-        target = compute_target(self.difficulty)
+        # Get target - use nbits for accuracy, fallback to difficulty
+        nbits = job[6] if len(job) > 6 and isinstance(job[6], str) else None
+        if nbits:
+            target = nbits_to_target(nbits) or compute_target(self.difficulty)
+        else:
+            target = compute_target(self.difficulty)
 
         # Get nonce batch
         nonce_start, nonce_end = self.get_next_nonce_batch(job_id)
