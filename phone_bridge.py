@@ -115,16 +115,32 @@ def build_header(job, extranonce1, extranonce2, nonce=0):
 
 
 def compute_target(difficulty):
-    """Convert difficulty to 32-byte target hex (big-endian)
+    """Convert difficulty to 32-byte target - matches ccminer diff_to_target()
     
-    ccminer uses: target = diff1 / difficulty
-    where diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    From ccminer util.c:
+    for (k = 6; k > 0 && diff > 1.0; k--)
+        diff /= 4294967296.0;
+    m = (uint64_t)(4294901760.0 / diff);
+    target[k] = m; target[k+1] = m >> 32;
     """
     if not difficulty or difficulty <= 0:
-        difficulty = 1
-    diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    target = int(diff1 / difficulty)
-    return target.to_bytes(32, 'big').hex()
+        difficulty = 1.0
+    
+    diff = float(difficulty)
+    k = 6
+    while k > 0 and diff > 1.0:
+        diff /= 4294967296.0
+        k -= 1
+    
+    m = int(4294901760.0 / diff)
+    
+    target = bytearray(32)
+    # target[k] = lower 32 bits, target[k+1] = upper 32 bits (little-endian uint32 array)
+    struct.pack_into('<I', target, k * 4, m & 0xFFFFFFFF)
+    if k + 1 < 8:
+        struct.pack_into('<I', target, (k + 1) * 4, (m >> 32) & 0xFFFFFFFF)
+    
+    return target.hex()
 
 
 def nbits_to_target(nbits_hex):
