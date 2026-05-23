@@ -307,15 +307,16 @@ class StratumClient:
             print(f'[ERROR] Worker request failed: {e}')
             return None
 
-    def submit_share(self, job_id, extranonce2, ntime, nonce_hex):
-        """Submit winning share to pool"""
+    def submit_share(self, job_id, ntime, nonce_hex, sol_hex):
+        """Submit winning share to pool - VerusCoin equihash format"""
         self.stats['submitted'] += 1
+        # VerusCoin submit: [user, job_id, ntime, nonce, solution]
         self.send('mining.submit', [
             f'{WALLET}.{WORKER}',
             job_id,
-            extranonce2,
             ntime,
-            nonce_hex
+            nonce_hex,
+            sol_hex
         ])
         resp = self.recv_response()
         if resp.get('result'):
@@ -348,22 +349,21 @@ class StratumClient:
 
         job = self.current_job
         job_id = job[0]
-        extranonce2 = '00' * self.extranonce2_size
-        # ntime is at params[5] in Luckpool format
-        ntime = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
+        # Luckpool format: [job_id, version, prevhash, coinb1, coinb2, ntime, nbits, clean, solution]
+        ntime   = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
+        solution = job[8] if len(job) > 8 and isinstance(job[8], str) else None
 
-        # Build header
+        # Build 140-byte header (VerusCoin uses 140 bytes, not 80)
         try:
-            header = build_header(job, self.extranonce1, extranonce2)
+            header = build_header(job, self.extranonce1, '00' * self.extranonce2_size)
             header_hex = header.hex()
             if self.stats['jobs'] <= 1:
                 print(f'[DEBUG] Header ({len(header)} bytes): {header_hex[:40]}...')
-                print(f'[DEBUG] extranonce1={self.extranonce1} extranonce2={extranonce2}')
         except Exception as e:
             log.error(f'Header build failed: {e}')
             return
 
-        # Get target - use nbits for accuracy, fallback to difficulty
+        # Get target from nbits
         nbits = job[6] if len(job) > 6 and isinstance(job[6], str) else None
         if nbits:
             target = nbits_to_target(nbits) or compute_target(self.difficulty)
@@ -374,11 +374,17 @@ class StratumClient:
         nonce_start, nonce_end = self.get_next_nonce_batch(job_id)
 
         print(f'Sending nonce range to Cloudflare Worker...')
-        if self.stats['jobs'] <= 2:  # Debug first 2 jobs only
-            print(f'[DEBUG] difficulty={self.difficulty} target={target[:16]}...')
+
+        # Build full data: header + solution_size_header + solution
+        # solution_size_header = 0xfd4005 (little-endian for 1344)
+        if solution and len(solution) == 2688:  # 1344 bytes * 2 hex chars
+            sol_size_header = 'fd4005'  # 0x0540fd in LE = 1344
+            full_data_hex = header_hex + sol_size_header + solution
+        else:
+            full_data_hex = header_hex
 
         # Send to Cloudflare Worker
-        result = self.offload_to_worker(header_hex, target, nonce_start)
+        result = self.offload_to_worker(full_data_hex, target, nonce_start)
         self.stats['hashes'] += BATCH_SIZE
 
         # Calculate hashrate
@@ -388,7 +394,9 @@ class StratumClient:
         if result and result.get('found'):
             nonce_hex = result['nonce_hex']
             print(f'[!!!] SHARE FOUND! nonce={nonce_hex}')
-            self.submit_share(job_id, extranonce2, ntime, nonce_hex)
+            # Build solution hex for submit
+            sol_hex = sol_size_header + solution if solution else '00' * 1347
+            self.submit_share(job_id, ntime, nonce_hex, sol_hex)
         else:
             s = self.stats
             print(f'Checked {BATCH_SIZE} hashes. No share found. [{hashrate:.2f} H/s | jobs={s["jobs"]} | submitted={s["submitted"]} | accepted={s["accepted"]} | rejected={s["rejected"]}]')
