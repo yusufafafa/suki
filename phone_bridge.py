@@ -65,51 +65,86 @@ def safe_hex(h, length=0):
 
 
 def build_header(job, extranonce1, extranonce2, nonce=0):
-    """Build 80-byte block header from Luckpool stratum job
+    """Build 80-byte block header - matches ccminer stratum_gen_work()
     
-    Luckpool actual format (verified from debug):
+    From ccminer cpu-miner.c stratum_gen_work():
+    work->data[0]    = le32dec(version)
+    work->data[1..8] = le32dec(prevhash[i])   -- prevhash as 8 LE uint32
+    work->data[9..16]= be32dec(merkle_root[i]) -- merkle as 8 BE uint32
+    work->data[17]   = le32dec(ntime)
+    work->data[18]   = le32dec(nbits)
+    work->data[19]   = nonce (LE)
+    
+    Luckpool format (verified from debug):
     params[0] = job_id
-    params[1] = version   (e.g. '04000100')
+    params[1] = version   (4 bytes hex)
     params[2] = prevhash  (64 hex chars)
     params[3] = coinb1
     params[4] = merkle_branch (list)
-    params[5] = ntime     (e.g. '44ef0e6a')
-    params[6] = nbits     (e.g. '9490041b')
+    params[5] = ntime     (8 hex chars)
+    params[6] = nbits     (8 hex chars)
     params[7] = clean_jobs (bool)
-    params[8] = coinb2 or extra data
+    params[8] = coinb2
     """
     try:
-        version       = job[1] if len(job) > 1 else '00000004'
-        prevhash      = job[2] if len(job) > 2 else '00' * 32
-        coinb1        = job[3] if len(job) > 3 else ''
-        merkle_branch = job[4] if len(job) > 4 else []
+        version       = job[1] if len(job) > 1 and isinstance(job[1], str) else '00000004'
+        prevhash      = job[2] if len(job) > 2 and isinstance(job[2], str) else '00' * 32
+        coinb1        = job[3] if len(job) > 3 and isinstance(job[3], str) else ''
+        merkle_branch = job[4] if len(job) > 4 and isinstance(job[4], list) else []
         ntime         = job[5] if len(job) > 5 and isinstance(job[5], str) else '%08x' % int(time.time())
         nbits         = job[6] if len(job) > 6 and isinstance(job[6], str) else '1e0fffff'
         coinb2        = job[8] if len(job) > 8 and isinstance(job[8], str) else ''
 
-        # Build coinbase
+        # Build coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
         coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
-        coinbase_bytes = safe_hex(coinbase)
+        coinbase_bytes = bytes.fromhex(coinbase) if coinbase else b''
         coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase_bytes).digest()).digest()
 
-        # Build merkle root
+        # Build merkle root (sha256d)
         merkle_root = coinbase_hash
         for branch in merkle_branch:
-            branch_bytes = safe_hex(branch, 32)
+            branch_bytes = bytes.fromhex(branch) if branch else b'\x00' * 32
             merkle_root = hashlib.sha256(
                 hashlib.sha256(merkle_root + branch_bytes).digest()
             ).digest()
 
-        # Build 80-byte header
-        header = (
-            swap_endian_words(version.zfill(8)) +
-            swap_endian_words(prevhash.zfill(64)) +
-            merkle_root +
-            swap_endian_words(ntime.zfill(8)) +
-            swap_endian_words(nbits.zfill(8)) +
-            struct.pack('<I', nonce)
-        )
-        return header
+        # Build header as 20 uint32 words (matches ccminer work->data[])
+        # data[0]: version as LE uint32
+        # data[1..8]: prevhash as 8 LE uint32 words
+        # data[9..16]: merkle_root as 8 BE uint32 words
+        # data[17]: ntime as LE uint32
+        # data[18]: nbits as LE uint32
+        # data[19]: nonce as LE uint32
+
+        header = bytearray(80)
+
+        # version (LE)
+        v = bytes.fromhex(version.zfill(8))
+        struct.pack_into('<I', header, 0, struct.unpack('>I', v)[0])
+
+        # prevhash: 8 LE uint32 words
+        ph = bytes.fromhex(prevhash.zfill(64))
+        for i in range(8):
+            word = struct.unpack('>I', ph[i*4:(i+1)*4])[0]
+            struct.pack_into('<I', header, 4 + i*4, word)
+
+        # merkle root: 8 BE uint32 words
+        for i in range(8):
+            word = struct.unpack('>I', merkle_root[i*4:(i+1)*4])[0]
+            struct.pack_into('>I', header, 36 + i*4, word)
+
+        # ntime (LE)
+        nt = bytes.fromhex(ntime.zfill(8))
+        struct.pack_into('<I', header, 68, struct.unpack('>I', nt)[0])
+
+        # nbits (LE)
+        nb = bytes.fromhex(nbits.zfill(8))
+        struct.pack_into('<I', header, 72, struct.unpack('>I', nb)[0])
+
+        # nonce (LE)
+        struct.pack_into('<I', header, 76, nonce)
+
+        return bytes(header)
     except Exception as e:
         raise ValueError(f'Header build failed: {e}')
 
