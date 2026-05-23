@@ -179,13 +179,20 @@ def compute_target(difficulty):
 
 
 def nbits_to_target(nbits_hex):
-    """Convert nbits to target (alternative to difficulty-based target)"""
+    """Convert nbits to 32-byte target (big-endian hex)"""
     try:
         nbits = int(nbits_hex, 16)
-        exponent = nbits >> 24
-        mantissa = nbits & 0xFFFFFF
-        target = mantissa * (2 ** (8 * (exponent - 3)))
-        return target.to_bytes(32, 'big').hex()
+        exponent = (nbits >> 24) & 0xFF
+        mantissa = nbits & 0x7FFFFF
+        # target = mantissa * 2^(8*(exponent-3))
+        shift = 8 * (exponent - 3)
+        if shift >= 0:
+            target_int = mantissa << shift
+        else:
+            target_int = mantissa >> (-shift)
+        # Clamp to 256 bits
+        target_int = min(target_int, 2**256 - 1)
+        return target_int.to_bytes(32, 'big').hex()
     except Exception:
         return None
 
